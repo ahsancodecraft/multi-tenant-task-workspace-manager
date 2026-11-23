@@ -6,11 +6,11 @@ from app.core.security import decode_access_token
 from app.db.models import UserModel
 from app.db.session import get_db
 
-bearer_scheme = HTTPBearer()
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> UserModel:
     unauthorized = HTTPException(
@@ -18,6 +18,9 @@ def get_current_user(
         detail="Missing, invalid, or expired authentication token",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    if credentials is None:
+        raise unauthorized
+
     try:
         payload = decode_access_token(credentials.credentials)
         sub = payload.get("sub")
@@ -28,6 +31,6 @@ def get_current_user(
         raise unauthorized
 
     user = db.query(UserModel).filter(UserModel.id == user_id).first()
-    if not user or not user.is_active:
+    if user is None or not user.is_active:
         raise unauthorized
     return user
