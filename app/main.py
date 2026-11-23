@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.core.logging_config import logger
 from app.db.session import Base, engine
 from app.domain.task import AuthorizationError, StateConflictError
+from app.api import admin, auth, tasks, workspaces
 
 Base.metadata.create_all(bind=engine)
 
@@ -51,3 +52,7 @@ def unhandled_exception_handler(request: Request, exc: Exception):
 app.include_router(auth.router)
 app.include_router(workspaces.router)
 app.include_router(tasks.router)
+app.include_router(auth.router)
+app.include_router(workspaces.router)
+app.include_router(tasks.router)
+app.include_router(admin.router)

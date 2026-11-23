@@ -104,3 +104,62 @@ def test_protected_route_with_expired_jwt_returns_401(client):
 
     # Assert
     assert response.status_code == 401
+    
+from app.db.models import UserModel
+from tests.conftest import TestingSessionLocal
+
+
+def test_standard_user_cannot_access_admin_routes_returns_403(client, auth_headers_factory):
+    # Arrange
+    user_headers = auth_headers_factory("normal_user@example.com")
+
+    # Act & Assert
+    overview_res = client.get("/api/admin/overview", headers=user_headers)
+    delete_res = client.delete("/api/admin/tasks/1", headers=user_headers)
+
+    assert overview_res.status_code == 403
+    assert delete_res.status_code == 403
+
+
+def test_admin_user_can_access_overview_and_remove_any_task(client, auth_headers_factory):
+    # Arrange: Standard user creates a workspace & task
+    alice_headers = auth_headers_factory("tenant_alice@example.com")
+    ws_id = client.post("/api/workspaces", json={"name": "Alice Team"}, headers=alice_headers).json()["id"]
+    task_id = client.post(
+        "/api/tasks",
+        json={"workspace_id": ws_id, "title": "Policy violating task", "priority": "URGENT"},
+        headers=alice_headers,
+    ).json()["id"]
+
+    # Register an admin account and elevate role in isolated test DB
+    client.post(
+        "/api/auth/register",
+        json={"email": "superadmin@example.com", "password": "StrongPassword123!"},
+    )
+    db = TestingSessionLocal()
+    try:
+        admin_row = db.query(UserModel).filter(UserModel.email == "superadmin@example.com").first()
+        admin_row.role = "admin"
+        db.commit()
+    finally:
+        db.close()
+
+    admin_token = client.post(
+        "/api/auth/login",
+        json={"email": "superadmin@example.com", "password": "StrongPassword123!"},
+    ).json()["access_token"]
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+    # Act 1: Admin inspects system-wide overview
+    overview_res = client.get("/api/admin/overview", headers=admin_headers)
+    assert overview_res.status_code == 200
+    overview = overview_res.json()
+    assert overview["total_users"] == 2
+    assert overview["total_workspaces"] == 1
+    assert overview["total_tasks"] == 1
+    assert overview["urgent_tasks"] == 1
+
+    # Act 2: Admin removes policy-violating task
+    del_res = client.delete(f"/api/admin/tasks/{task_id}", headers=admin_headers)
+    assert del_res.status_code == 204
+    assert client.get(f"/api/tasks/{task_id}", headers=alice_headers).status_code == 404
