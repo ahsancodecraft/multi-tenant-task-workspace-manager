@@ -51,3 +51,13 @@ class TaskResponse(BaseModel):
     status: str
     due_date: datetime | None
     created_at: datetime
+
+class AnalyticsOut(BaseModel):
+    total: int
+    todo: int
+    in_progress: int
+    done: int
+    archived: int
+    urgent_count: int
+    completion_rate: float
+    cached: bool = False

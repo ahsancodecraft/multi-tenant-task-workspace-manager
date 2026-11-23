@@ -1,10 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
+from app.core.logging_config import logger
 from app.db.models import TaskModel, UserModel, WorkspaceModel
 from app.db.session import get_db
 from app.domain.task import Task as DomainTask, Workspace as DomainWorkspace
-from app.schemas.task import TaskCreate, TaskResponse, TaskUpdate
+from app.schemas.task import AnalyticsOut, TaskCreate, TaskResponse, TaskUpdate
+from app.services.task_service import task_service
 
 router = APIRouter(prefix="/api/tasks", tags=["Tasks"])
 
@@ -12,6 +14,7 @@ router = APIRouter(prefix="/api/tasks", tags=["Tasks"])
 @router.post("", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 def create_task(
     payload: TaskCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
@@ -19,7 +22,6 @@ def create_task(
     if not ws_row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
 
-    # Verify workspace ownership before creating task inside it
     domain_ws = DomainWorkspace(id=ws_row.id, owner_id=ws_row.owner_id, name=ws_row.name)
     domain_ws.verify_owner(current_user.id)
 
@@ -43,6 +45,18 @@ def create_task(
     db.add(task_row)
     db.commit()
     db.refresh(task_row)
+
+    # Invalidate cached analytics & offload URGENT notification to background job
+    task_service.invalidate_user_analytics(current_user.id)
+    logger.info(f"task_created | task_id={task_row.id} | user_id={current_user.id} | priority={task_row.priority}")
+
+    if task_row.priority == "URGENT":
+        background_tasks.add_task(
+            task_service.dispatcher.send_urgent_alert,
+            current_user.email,
+            task_row.title,
+        )
+
     return task_row
 
 
@@ -59,6 +73,14 @@ def list_tasks(
     if priority:
         query = query.filter(TaskModel.priority == priority)
     return query.all()
+
+
+@router.get("/analytics", response_model=AnalyticsOut)
+def get_tasks_analytics(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    return task_service.get_user_analytics(db=db, user_id=current_user.id)
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
@@ -87,6 +109,7 @@ def get_task(
 def update_task(
     task_id: int,
     payload: TaskUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
@@ -103,6 +126,8 @@ def update_task(
         _status=task_row.status,
     )
     domain_task.ensure_owner(current_user.id)
+
+    became_urgent = payload.priority == "URGENT" and task_row.priority != "URGENT"
 
     if payload.status is not None:
         domain_task.transition_to(payload.status)
@@ -124,6 +149,17 @@ def update_task(
 
     db.commit()
     db.refresh(task_row)
+
+    task_service.invalidate_user_analytics(current_user.id)
+    logger.info(f"task_updated | task_id={task_row.id} | user_id={current_user.id} | status={task_row.status}")
+
+    if became_urgent:
+        background_tasks.add_task(
+            task_service.dispatcher.send_urgent_alert,
+            current_user.email,
+            task_row.title,
+        )
+
     return task_row
 
 
@@ -149,4 +185,7 @@ def delete_task(
 
     db.delete(task_row)
     db.commit()
+
+    task_service.invalidate_user_analytics(current_user.id)
+    logger.info(f"task_deleted | task_id={task_id} | user_id={current_user.id}")
     return None

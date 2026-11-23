@@ -166,3 +166,80 @@ def test_cross_tenant_idor_access_denied(client, auth_headers_factory):
         ).status_code
         == 403
     )
+
+
+import logging
+from app.core.logging_config import logger
+from app.services.task_service import FakeNotificationDispatcher, task_service
+
+
+def test_analytics_caching_and_invalidation_on_mutation(client, auth_headers_factory):
+    # Arrange
+    headers = auth_headers_factory("analytics@example.com")
+    ws_id = client.post("/api/workspaces", json={"name": "Analytics WS"}, headers=headers).json()["id"]
+    client.post("/api/tasks", json={"workspace_id": ws_id, "title": "Task 1", "priority": "URGENT"}, headers=headers)
+
+    # Act 1: First call -> Cache Miss (cached=False)
+    first_res = client.get("/api/tasks/analytics", headers=headers)
+    assert first_res.status_code == 200
+    assert first_res.json()["cached"] is False
+    assert first_res.json()["total"] == 1
+    assert first_res.json()["urgent_count"] == 1
+
+    # Act 2: Second call within 60s -> Cache Hit (cached=True)
+    second_res = client.get("/api/tasks/analytics", headers=headers)
+    assert second_res.status_code == 200
+    assert second_res.json()["cached"] is True
+
+    # Act 3: Create another task -> Cache Invalidated -> Next call is fresh (cached=False, total=2)
+    client.post("/api/tasks", json={"workspace_id": ws_id, "title": "Task 2", "priority": "LOW"}, headers=headers)
+    third_res = client.get("/api/tasks/analytics", headers=headers)
+    assert third_res.json()["cached"] is False
+    assert third_res.json()["total"] == 2
+
+
+def test_urgent_task_triggers_background_notification(client, auth_headers_factory):
+    # Arrange: Swap in FakeNotificationDispatcher
+    fake_dispatcher = FakeNotificationDispatcher()
+    original_dispatcher = task_service.dispatcher
+    task_service.dispatcher = fake_dispatcher
+
+    try:
+        headers = auth_headers_factory("urgent_user@example.com")
+        ws_id = client.post("/api/workspaces", json={"name": "Ops WS"}, headers=headers).json()["id"]
+
+        # Act
+        res = client.post(
+            "/api/tasks",
+            json={"workspace_id": ws_id, "title": "Rotate production keys", "priority": "URGENT"},
+            headers=headers,
+        )
+
+        # Assert
+        assert res.status_code == 201
+        assert len(fake_dispatcher.sent) == 1
+        assert fake_dispatcher.sent[0] == ("urgent_user@example.com", "Rotate production keys")
+    finally:
+        task_service.dispatcher = original_dispatcher
+
+
+def test_structured_logging_redacts_secrets_and_captures_error(caplog):
+    # Arrange
+    caplog.set_level(logging.DEBUG, logger="task_manager")
+    logger.propagate = True
+
+    try:
+        # Act: Log sensitive payload and trigger an ERROR log
+        logger.info("Auth attempt password=MyPlainPassword123 token=Bearer eyJhbGciOiJIUzI1NiJ9.abc.def")
+        try:
+            raise RuntimeError("Simulated database timeout failure")
+        except RuntimeError as err:
+            logger.error("Critical DB failure occurred", exc_info=err)
+
+        # Assert
+        assert "MyPlainPassword123" not in caplog.text
+        assert "eyJhbGciOiJIUzI1NiJ9" not in caplog.text
+        assert "[REDACTED]" in caplog.text
+        assert "Critical DB failure occurred" in caplog.text
+    finally:
+        logger.propagate = False
